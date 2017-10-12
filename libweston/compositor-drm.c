@@ -335,6 +335,9 @@ struct drm_output {
 	struct wl_listener recorder_frame_listener;
 
 	struct wl_event_source *pageflip_timer;
+
+	bool virtual;
+	struct wl_event_source *virtual_finish_frame_timer;
 };
 
 static struct gl_renderer_interface *gl_renderer;
@@ -1428,6 +1431,9 @@ vblank_handler(int fd, unsigned int frame, unsigned int sec, unsigned int usec,
 
 static void
 drm_output_destroy(struct weston_output *base);
+
+static void
+drm_virtual_output_destroy(struct weston_output *base);
 
 static void
 page_flip_handler(int fd, unsigned int frame,
@@ -3955,10 +3961,250 @@ renderer_switch_binding(struct weston_keyboard *keyboard, uint32_t time,
 	switch_to_gl_renderer(b);
 }
 
+static void
+drm_virtual_output_start_repaint_loop(struct weston_output *output)
+{
+	struct timespec now;
+
+	weston_log("%s: %s: output=%p\n", __FILE__, __func__, output);
+	weston_compositor_read_presentation_clock(output->compositor, &now);
+	weston_output_finish_frame(output, &now,
+				   WP_PRESENTATION_FEEDBACK_INVALID);
+}
+
+static int
+drm_virtual_output_repaint(struct weston_output *base,
+			   pixman_region32_t *damage,
+			   void *repaint_data)
+{
+	struct drm_output *output = to_drm_output(base);
+	struct timespec ts;
+	uint32_t msec_next, msec_current;
+
+	weston_log("%s: %s: output=%p\n", __FILE__, __func__, output);
+	msec_next = output->base.frame_time +
+		1000000UL / output->base.current_mode->refresh;
+
+	if (output->disable_pending || output->destroy_pending)
+		return -1;
+
+	drm_output_render(output, damage);
+	if (!output->fb_pending)
+		return -1;
+
+	output->fb_last = output->fb_current;
+	output->fb_current = output->fb_pending;
+	output->fb_pending = NULL;
+
+	assert(!output->page_flip_pending);
+	output->page_flip_pending = 1;
+
+	weston_compositor_read_presentation_clock(base->compositor, &ts);
+
+	msec_current = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+
+	/*
+	 * If we somehow late with updating frame, then fireup timer immediately (1 msec)
+	 */
+	wl_event_source_timer_update(output->virtual_finish_frame_timer,
+				     (msec_next > msec_current)  ?
+					msec_next - msec_current : 1);
+
+	return 0;
+}
+
+static int
+drm_virtual_output_finish_frame_handler(void *data)
+{
+	struct drm_output *output = data;
+	struct timespec ts;
+	static unsigned int frame = 0;
+
+	weston_log("%s: %s: output=%p\n", __FILE__, __func__, output);
+	drm_output_update_msc(output, frame);
+	frame++;
+
+	assert(output->page_flip_pending);
+	output->page_flip_pending = 0;
+
+	drm_fb_unref(output->fb_last);
+	output->fb_last = NULL;
+
+	if (output->destroy_pending)
+		drm_virtual_output_destroy(&output->base);
+	else if (output->disable_pending)
+		weston_output_disable(&output->base);
+	else if (!output->vblank_pending) {
+		weston_compositor_read_presentation_clock(output->base.compositor, &ts);
+		weston_output_finish_frame(&output->base, &ts, 0);
+
+		/* We can't call this from frame_notify, because the output's
+		 * repaint needed flag is cleared just after that */
+		if (output->recorder)
+			weston_output_schedule_repaint(&output->base);
+	}
+
+	return 1;
+}
+
+static int
+drm_virtual_output_enable(struct weston_output *base)
+{
+	struct drm_output *output = to_drm_output(base);
+	struct drm_backend *b = to_drm_backend(base->compositor);
+	struct wl_event_loop *loop;
+
+	weston_log("%s: %s: output=%p\n", __FILE__, __func__, output);
+
+	loop = wl_display_get_event_loop(base->compositor->wl_display);
+	output->virtual_finish_frame_timer =
+		wl_event_loop_add_timer(loop,
+					drm_virtual_output_finish_frame_handler,
+					output);
+
+	if (b->use_pixman) {
+		weston_log("Not support pixman renderer on Virtual output\n");
+		goto err;
+	}
+
+	if (drm_output_init_egl(output, b) < 0) {
+		weston_log("Failed to init output gl state\n");
+		goto err;
+	}
+
+	output->base.start_repaint_loop = drm_virtual_output_start_repaint_loop;
+	output->base.repaint = drm_virtual_output_repaint;
+	output->base.assign_planes = NULL;
+	output->base.set_dpms = NULL;
+	output->base.switch_mode = NULL;
+	output->base.gamma_size = 0;
+	output->base.set_gamma = NULL;
+	output->base.subpixel = WL_OUTPUT_SUBPIXEL_NONE;
+
+	weston_plane_init(&output->cursor_plane, b->compositor,
+			  INT32_MIN, INT32_MIN);
+	weston_plane_init(&output->scanout_plane, b->compositor, 0, 0);
+
+	weston_compositor_stack_plane(b->compositor, &output->cursor_plane,
+				      NULL);
+	weston_compositor_stack_plane(b->compositor, &output->scanout_plane,
+				      &b->compositor->primary_plane);
+
+	weston_log("Output %s\n", output->base.name);
+
+	output->state_invalid = true;
+
+	return 0;
+err:
+	return -1;
+}
+
+static int
+drm_virtual_output_disable(struct weston_output *base)
+{
+	struct drm_output *output = to_drm_output(base);
+
+	weston_log("%s: %s: output=%p\n", __FILE__, __func__, output);
+	if (output->page_flip_pending) {
+		output->disable_pending = 1;
+		return -1;
+	}
+
+	if (output->base.enabled)
+		drm_output_deinit(&output->base);
+
+	return 0;
+}
+
+static void
+drm_virtual_output_destroy(struct weston_output *base)
+{
+	struct drm_output *output = to_drm_output(base);
+	struct weston_mode *mode, *next;
+
+	weston_log("%s: %s: output=%p\n", __FILE__, __func__, output);
+	if (output->page_flip_pending) {
+		output->destroy_pending = 1;
+		weston_log("destroy output while page flip pending\n");
+		return;
+	}
+
+	if (output->base.enabled)
+		drm_output_deinit(&output->base);
+
+	wl_list_for_each_safe(mode, next, &output->base.mode_list,
+			      link)
+		free(mode);
+
+	if (output->pageflip_timer)
+		wl_event_source_remove(output->pageflip_timer);
+
+	weston_output_destroy(&output->base);
+
+	free(output);
+}
+
+static struct weston_output *
+drm_virtual_output_create(struct weston_compositor *c, char *name)
+{
+	struct drm_output *output;
+
+	weston_log("%s: %s\n", __FILE__, __func__);
+	output = zalloc(sizeof *output);
+	if (!output)
+		return NULL;
+
+	output->virtual = true;
+
+	output->base.enable = drm_virtual_output_enable;
+	output->base.destroy = drm_virtual_output_destroy;
+	output->base.disable = drm_virtual_output_disable;
+
+	wl_list_init(&output->base.mode_list);
+
+	output->base.name = strdup(name);
+
+	weston_output_init(&output->base, c);
+	weston_compositor_add_pending_output(&output->base, c);
+
+	weston_log("%s: %s: created virtual output=%p\n", __FILE__, __func__, output);
+	return &output->base;
+}
+
+static int
+drm_output_get_current_dmabuf_fd(struct weston_output *base)
+{
+	struct drm_output *output = to_drm_output(base);
+	struct drm_fb *fb = output->fb_current;
+	int fd, ret;
+
+	weston_log("%s: %s: output=%p\n", __FILE__, __func__, output);
+	if (!fb) {
+		weston_log("fb_current = NULL\n");
+		return -1;
+	}
+
+	/* XXX: It will give us previous (not current) buffer FD,
+	   but we may need to get current one. */
+	ret = drmPrimeHandleToFD(fb->fd, fb->handle, DRM_CLOEXEC, &fd);
+	if (ret < 0) {
+		weston_log("drmPrimeHandleToFD failed \n");
+		return -1;
+	}
+
+	return fd;
+}
+
 static const struct weston_drm_output_api api = {
 	drm_output_set_mode,
 	drm_output_set_gbm_format,
 	drm_output_set_seat,
+};
+
+static const struct weston_drm_virtual_output_api virt_api = {
+	drm_virtual_output_create,
+	drm_output_set_gbm_format,
+	drm_output_get_current_dmabuf_fd,
 };
 
 static struct drm_backend *
@@ -4117,6 +4363,14 @@ drm_backend_create(struct weston_compositor *compositor,
 
 	if (ret < 0) {
 		weston_log("Failed to register output API.\n");
+		goto err_udev_monitor;
+	}
+
+	ret = weston_plugin_api_register(compositor,
+					 WESTON_DRM_VIRTUAL_OUTPUT_API_NAME,
+					 &virt_api, sizeof(virt_api));
+	if (ret < 0) {
+		weston_log("Failed to register virtual output API.\n");
 		goto err_udev_monitor;
 	}
 
