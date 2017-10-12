@@ -64,6 +64,7 @@
 #include "compositor-x11.h"
 #include "compositor-wayland.h"
 #include "windowed-output-api.h"
+#include "../remoting/remoting-plugin.h"
 
 #define WINDOW_TITLE "Weston Compositor"
 
@@ -1150,6 +1151,65 @@ configure_input_device(struct weston_compositor *compositor,
 }
 
 static void
+drm_backend_remoted_output_configure(struct weston_output *output,
+				     struct weston_config *wc,
+				     const struct weston_remoting_api *api)
+{
+	struct weston_config_section *section = NULL;
+	char *modeline = NULL;
+	char *gbm_format = NULL;
+	char *seat = NULL;
+	char *host = NULL;
+	int port, bitrate, ret;
+
+	weston_log("%s: %s output->name=%s\n", __FILE__, __func__, output->name);
+	section = weston_config_get_section(wc, "remote-output", "name",
+					    output->name);
+
+	weston_config_section_get_string(section, "mode", &modeline, "off");
+
+	if (strcmp(modeline, "off") == 0) {
+		weston_output_disable(output);
+		free(modeline);
+		return;
+	}
+
+	ret = api->set_mode(output, modeline);
+	free(modeline);
+	if (ret < 0)
+		return;
+
+	wet_output_set_scale(output, section, 1, 0);
+	wet_output_set_transform(output, section, WL_OUTPUT_TRANSFORM_NORMAL,
+				 UINT32_MAX);
+
+	weston_config_section_get_string(section, "gbm-fromat", &gbm_format,
+					 NULL);
+	api->set_gbm_format(output, gbm_format);
+	free(gbm_format);
+
+	weston_config_section_get_string(section, "seat", &seat, "");
+
+	api->set_seat(output, seat);
+	free(seat);
+
+	weston_config_section_get_string(section, "host", &host, NULL);
+	if (!host)
+		return;
+	api->set_host(output, host);
+	free(host);
+
+	weston_config_section_get_int(section, "port", &port, 0);
+	if (port > 0)
+		api->set_port(output, port);
+	weston_config_section_get_int(section, "bitrate", &bitrate, 0);
+	if (bitrate > 0)
+		api->set_bitrate(output, bitrate);
+
+	weston_output_enable(output);
+}
+
+static void
 drm_backend_output_configure(struct wl_listener *listener, void *data)
 {
 	struct weston_output *output = data;
@@ -1157,6 +1217,8 @@ drm_backend_output_configure(struct wl_listener *listener, void *data)
 	struct wet_compositor *wet = to_wet_compositor(output->compositor);
 	struct weston_config_section *section;
 	const struct weston_drm_output_api *api = weston_drm_output_get_api(output->compositor);
+	const struct weston_remoting_api *remoting_api =
+		weston_remoting_get_api(output->compositor);
 	enum weston_drm_backend_output_mode mode =
 		WESTON_DRM_BACKEND_OUTPUT_PREFERRED;
 
@@ -1168,6 +1230,14 @@ drm_backend_output_configure(struct wl_listener *listener, void *data)
 	if (!api) {
 		weston_log("Cannot use weston_drm_output_api.\n");
 		return;
+	}
+
+	if (remoting_api) {
+		if (remoting_api->is_remoted_output(output)) {
+			drm_backend_remoted_output_configure(output, wc,
+							     remoting_api);
+			return;
+		}
 	}
 
 	section = weston_config_get_section(wc, "output", "name", output->name);
@@ -1209,6 +1279,47 @@ drm_backend_output_configure(struct wl_listener *listener, void *data)
 	weston_output_enable(output);
 }
 
+static void
+load_remoting(struct weston_compositor *c, struct weston_config *wc)
+{
+	const struct weston_remoting_api *api = NULL;
+	int (*module_init)(struct weston_compositor *ec);
+	struct weston_config_section *section = NULL;
+	const char *section_name;
+	char *output_name;
+
+	/* read remote-output section in weston.ini */
+	while (weston_config_next_section(wc, &section, &section_name)) {
+		if (strcmp(section_name, "remote-output"))
+			continue;
+
+		if (!api) {
+			module_init = weston_load_module("remoting-plugin.so",
+							 "weston_module_init");
+			if (!module_init) {
+				weston_log("Can't load remoting-plugin\n");
+				return;
+			}
+			if (module_init(c) < 0) {
+				weston_log("Remoting-plugin init failed\n");
+				return;
+			}
+
+			api = weston_remoting_get_api(c);
+			if (!api)
+				return;
+		}
+
+		weston_config_section_get_string(section, "name", &output_name,
+						 NULL);
+		if (!output_name)
+			continue;
+
+		api->create_output(c, output_name);
+		free(output_name);
+	}
+}
+
 static int
 load_drm_backend(struct weston_compositor *c,
 		 int *argc, char **argv, struct weston_config *wc)
@@ -1242,6 +1353,9 @@ load_drm_backend(struct weston_compositor *c,
 
 	ret = weston_compositor_load_backend(c, WESTON_BACKEND_DRM,
 					     &config.base);
+
+	/* remoting */
+	load_remoting(c, wc);
 
 	wet_set_pending_output_handler(c, drm_backend_output_configure);
 
