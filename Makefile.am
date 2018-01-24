@@ -398,6 +398,21 @@ drm_backend_la_LIBADD += $(LIBVA_LIBS)
 drm_backend_la_LDFLAGS += -pthread
 drm_backend_la_CFLAGS += $(LIBVA_CFLAGS)
 endif
+
+# remoting
+if ENABLE_REMOTING
+libweston_module_LTLIBRARIES += remoting-plugin.la
+remoting_plugin_la_LDFLAGS = -module -avoid-version
+remoting_plugin_la_LIBADD =			\
+	$(COMPOSITOR_LIBS)
+remoting_plugin_la_CFLAGS =			\
+	$(COMPOSITOR_CFLAGS)			\
+	$(AM_CFLAGS)
+remoting_plugin_la_SOURCES =			\
+	remoting/remoting-plugin.c		\
+	remoting/remoting-plugin.h		\
+	remoting/remoting-backend.h
+
 endif
 
 if ENABLE_WAYLAND_COMPOSITOR
