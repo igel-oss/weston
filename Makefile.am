@@ -413,6 +413,20 @@ remoting_plugin_la_SOURCES =			\
 	remoting/remoting-plugin.h		\
 	remoting/remoting-backend.h
 
+libweston_module_LTLIBRARIES += remoting-gst.la
+remoting_gst_la_LDFLAGS = -module -avoid-version
+remoting_gst_la_LIBADD =			\
+	$(COMPOSITOR_LIBS)			\
+	$(REMOTING_GST_LIBS)
+remoting_gst_la_CFLAGS =			\
+	$(COMPOSITOR_CFLAGS)			\
+	$(REMOTING_GST_CFLAGS)			\
+	$(AM_CFLAGS)
+remoting_gst_la_SOURCES =			\
+	remoting/remoting-gst.c			\
+	remoting/remoting-backend.h
+endif
+
 endif
 
 if ENABLE_WAYLAND_COMPOSITOR

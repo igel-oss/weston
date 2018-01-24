@@ -336,8 +336,17 @@ static const struct weston_remoting_api remoting_api = {
 static int
 backend_init(struct weston_remoting *r, struct weston_compositor *c)
 {
-	/* Return error because there is not backend */
-	return -1;
+	struct remoting_backend *(*init)(struct weston_compositor *c);
+
+	init = weston_load_module("remoting-gst.so", "remoting_backend_init");
+	if (!init)
+		return -1;
+
+	r->backend = init(c);
+	if (!r->backend)
+		return -1;
+
+	return 0;
 }
 
 WL_EXPORT int

@@ -213,6 +213,7 @@ if test x$enable_remoting = xyes; then
   if test x$enable_drm_compositor != xyes; then
     AC_MSG_WARN([The remoting-plugin.so module requires the DRM backend.])
   fi
+  PKG_CHECK_MODULES(REMOTING_GST, [gstreamer-1.0 gstreamer-allocators-1.0 gstreamer-app-1.0 gstreamer-video-1.0])
 fi
 
 
