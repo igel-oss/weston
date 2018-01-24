@@ -60,6 +60,7 @@
 #include "compositor-x11.h"
 #include "compositor-wayland.h"
 #include "windowed-output-api.h"
+#include "../remoting/remoting-plugin.h"
 
 #define WINDOW_TITLE "Weston Compositor"
 
@@ -1350,6 +1351,141 @@ drm_backend_output_configure(struct weston_output *output)
 }
 
 static int
+drm_backend_remoted_output_configure(struct weston_output *output,
+				     struct weston_config_section *section,
+				     const struct weston_remoting_api *api)
+{
+	char *modeline = NULL;
+	char *gbm_format = NULL;
+	char *seat = NULL;
+	char *host = NULL;
+	int port, ret;
+
+	weston_log("remoted output: name=%s\n", output->name);
+
+	weston_config_section_get_string(section, "mode", &modeline, "off");
+
+	if (strcmp(modeline, "off") == 0) {
+		weston_output_disable(output);
+		free(modeline);
+		return -1;
+	}
+
+	ret = api->set_mode(output, modeline);
+	free(modeline);
+	if (ret < 0) {
+		weston_log("Cannot configure an output \"%s\" using "
+			   "weston_remoting_api. Invalid mode\n",
+			   output->name);
+		return -1;
+	}
+
+	wet_output_set_scale(output, section, 1, 0);
+	wet_output_set_transform(output, section, WL_OUTPUT_TRANSFORM_NORMAL,
+				 UINT32_MAX);
+
+	weston_config_section_get_string(section, "gbm-fromat", &gbm_format,
+					 NULL);
+	api->set_gbm_format(output, gbm_format);
+	free(gbm_format);
+
+	weston_config_section_get_string(section, "seat", &seat, "");
+
+	api->set_seat(output, seat);
+	free(seat);
+
+	weston_config_section_get_string(section, "host", &host, NULL);
+	if (!host) {
+		weston_log("Cannot configure an output \"%s\". Invalid host\n",
+			   output->name);
+		return -1;
+	}
+	api->set_host(output, host);
+	free(host);
+
+	weston_config_section_get_int(section, "port", &port, 0);
+	if (port <= 0) {
+		weston_log("Cannot configure an output \"%s\". Invalid port\n",
+			   output->name);
+		return -1;
+	}
+	api->set_port(output, port);
+
+	return 0;
+}
+
+static void
+remoted_output_create_and_enable(struct weston_compositor *c, char *output_name,
+				 struct weston_config_section *section,
+				 const struct weston_remoting_api *api)
+{
+	struct weston_output *output;
+	int ret;
+
+	output = api->create_output(c, output_name);
+	if (!output) {
+		weston_log("Cannot create remoted ouptut \"%s\".\n",
+			   output_name);
+		return;
+	}
+
+	ret = drm_backend_remoted_output_configure(output, section, api);
+	if (ret < 0) {
+		weston_log("Cannot configure remoted output \"%s\".\n",
+			   output_name);
+		weston_output_destroy(output);
+		return;
+	}
+
+	if (weston_output_enable(output) < 0) {
+		weston_log("Enabling remoted output \"%s\" failed.\n",
+			   output_name);
+		weston_output_destroy(output);
+	}
+}
+
+static void
+load_remoting(struct weston_compositor *c, struct weston_config *wc)
+{
+	const struct weston_remoting_api *api = NULL;
+	int (*module_init)(struct weston_compositor *ec);
+	struct weston_config_section *section = NULL;
+	const char *section_name;
+	char *output_name;
+
+	/* read remote-output section in weston.ini */
+	while (weston_config_next_section(wc, &section, &section_name)) {
+		if (strcmp(section_name, "remote-output"))
+			continue;
+
+		if (!api) {
+			module_init = weston_load_module("remoting-plugin.so",
+							 "weston_module_init");
+			if (!module_init) {
+				weston_log("Can't load remoting-plugin\n");
+				return;
+			}
+			if (module_init(c) < 0) {
+				weston_log("Remoting-plugin init failed\n");
+				return;
+			}
+
+			api = weston_remoting_get_api(c);
+			if (!api)
+				return;
+		}
+
+		weston_config_section_get_string(section, "name", &output_name,
+						 NULL);
+		if (!output_name)
+			continue;
+
+		remoted_output_create_and_enable(c, output_name, section, api);
+		free(output_name);
+	}
+}
+
+static int
 load_drm_backend(struct weston_compositor *c,
 		 int *argc, char **argv, struct weston_config *wc)
 {
@@ -1388,6 +1524,9 @@ load_drm_backend(struct weston_compositor *c,
 
 	ret = weston_compositor_load_backend(c, WESTON_BACKEND_DRM,
 					     &config.base);
+
+	/* remoting */
+	load_remoting(c, wc);
 
 	free(config.gbm_format);
 	free(config.seat_id);
