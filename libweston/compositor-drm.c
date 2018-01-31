@@ -1985,7 +1985,8 @@ choose_mode (struct drm_output *output, struct weston_mode *target_mode)
 }
 
 static int
-drm_output_init_egl(struct drm_output *output, struct drm_backend *b);
+drm_output_init_egl(struct drm_output *output, struct drm_backend *b,
+		    uint32_t gbm_bo_flags);
 static void
 drm_output_fini_egl(struct drm_output *output);
 static int
@@ -2047,8 +2048,9 @@ drm_output_switch_mode(struct weston_output *output_base, struct weston_mode *mo
 			return -1;
 		}
 	} else {
+		uint32_t flags = GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING;
 		drm_output_fini_egl(output);
-		if (drm_output_init_egl(output, b) < 0) {
+		if (drm_output_init_egl(output, b, flags) < 0) {
 			weston_log("failed to init output egl state with "
 				   "new mode");
 			return -1;
@@ -2627,7 +2629,8 @@ err:
 
 /* Init output state that depends on gl or gbm */
 static int
-drm_output_init_egl(struct drm_output *output, struct drm_backend *b)
+drm_output_init_egl(struct drm_output *output, struct drm_backend *b,
+		    uint32_t gbm_bo_flags)
 {
 	EGLint format[2] = {
 		output->gbm_format,
@@ -2639,8 +2642,7 @@ drm_output_init_egl(struct drm_output *output, struct drm_backend *b)
 					     output->base.current_mode->width,
 					     output->base.current_mode->height,
 					     format[0],
-					     GBM_BO_USE_SCANOUT |
-					     GBM_BO_USE_RENDERING);
+					     gbm_bo_flags);
 	if (!output->gbm_surface) {
 		weston_log("failed to create gbm surface\n");
 		return -1;
@@ -3155,6 +3157,7 @@ drm_output_enable(struct weston_output *base)
 	struct drm_output *output = to_drm_output(base);
 	struct drm_backend *b = to_drm_backend(base->compositor);
 	struct weston_mode *m;
+	uint32_t flags = GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING;
 
 	if (b->pageflip_timeout)
 		drm_output_pageflip_timer_create(output);
@@ -3164,7 +3167,7 @@ drm_output_enable(struct weston_output *base)
 			weston_log("Failed to init output pixman state\n");
 			goto err;
 		}
-	} else if (drm_output_init_egl(output, b) < 0) {
+	} else if (drm_output_init_egl(output, b, flags) < 0) {
 		weston_log("Failed to init output gl state\n");
 		goto err;
 	}
@@ -3967,7 +3970,8 @@ switch_to_gl_renderer(struct drm_backend *b)
 	}
 
 	wl_list_for_each(output, &b->compositor->output_list, base.link)
-		drm_output_init_egl(output, b);
+		drm_output_init_egl(output, b,
+				    GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
 
 	b->use_pixman = 0;
 
