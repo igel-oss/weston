@@ -313,6 +313,7 @@ struct drm_output {
 
 	struct gbm_surface *gbm_surface;
 	uint32_t gbm_format;
+	uint32_t gbm_bo_flags;
 
 	/* Plane for a fullscreen direct scanout view */
 	struct weston_plane scanout_plane;
@@ -2639,8 +2640,7 @@ drm_output_init_egl(struct drm_output *output, struct drm_backend *b)
 					     output->base.current_mode->width,
 					     output->base.current_mode->height,
 					     format[0],
-					     GBM_BO_USE_SCANOUT |
-					     GBM_BO_USE_RENDERING);
+					     output->gbm_bo_flags);
 	if (!output->gbm_surface) {
 		weston_log("failed to create gbm surface\n");
 		return -1;
@@ -3361,6 +3361,8 @@ create_output_for_connector(struct drm_backend *b,
 					   connector->connector_type);
 
 	output->original_crtc = drmModeGetCrtc(b->drm.fd, output->crtc_id);
+
+	output->gbm_bo_flags = GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING;
 
 	name = make_connector_name(connector);
 	weston_output_init(&output->base, b->compositor, name);
