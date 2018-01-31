@@ -83,6 +83,10 @@
 #define GBM_BO_USE_CURSOR GBM_BO_USE_CURSOR_64X64
 #endif
 
+#ifndef GBM_BO_USE_LINEAR
+#define GBM_BO_USE_LINEAR (1 << 4)
+#endif
+
 /**
  * Represents the values of an enum-type KMS property
  */
@@ -450,6 +454,9 @@ struct drm_output {
 	struct wl_listener recorder_frame_listener;
 
 	struct wl_event_source *pageflip_timer;
+
+	bool virtual;
+	struct timespec repaint_start;
 };
 
 static struct gl_renderer_interface *gl_renderer;
@@ -747,6 +754,9 @@ drm_output_update_msc(struct drm_output *output, unsigned int seq);
 
 static void
 drm_output_destroy(struct weston_output *output_base);
+
+static void
+drm_virtual_output_destroy(struct weston_output *output_base);
 
 /**
  * Returns true if the plane can be used on the given output for its current
@@ -1435,6 +1445,37 @@ drm_output_update_complete(struct drm_output *output, uint32_t flags,
 	ts.tv_sec = sec;
 	ts.tv_nsec = usec * 1000;
 	weston_output_finish_frame(&output->base, &ts, flags);
+
+	/* We can't call this from frame_notify, because the output's
+	 * repaint needed flag is cleared just after that */
+	if (output->recorder)
+		weston_output_schedule_repaint(&output->base);
+}
+
+static void
+drm_virtual_output_update_complete(struct drm_output *output, uint32_t flags,
+				   struct timespec *ts)
+{
+	struct drm_plane_state *ps;
+
+	wl_list_for_each(ps, &output->state_cur->plane_list, link)
+		ps->complete = true;
+
+	drm_output_state_free(output->state_last);
+	output->state_last = NULL;
+
+	if (output->destroy_pending) {
+		output->destroy_pending = 0;
+		output->disable_pending = 0;
+		drm_virtual_output_destroy(&output->base);
+		return;
+	} else if (output->disable_pending) {
+		output->disable_pending = 0;
+		weston_output_disable(&output->base);
+		return;
+	}
+
+	weston_output_finish_frame(&output->base, ts, flags);
 
 	/* We can't call this from frame_notify, because the output's
 	 * repaint needed flag is cleared just after that */
@@ -2291,6 +2332,12 @@ drm_pending_state_apply(struct drm_pending_state *pending_state)
 		struct drm_output *output = output_state->output;
 		int ret;
 
+		if (output->virtual) {
+			drm_output_assign_state(output_state,
+						DRM_STATE_APPLY_ASYNC);
+			continue;
+		}
+
 		ret = drm_output_apply_state_legacy(output_state);
 		if (ret != 0) {
 			weston_log("Couldn't apply state for output %s\n",
@@ -2368,6 +2415,8 @@ drm_output_repaint(struct weston_output *output_base,
 	struct drm_output *output = to_drm_output(output_base);
 	struct drm_output_state *state = NULL;
 	struct drm_plane_state *scanout_state;
+
+	assert(!output->virtual);
 
 	if (output->disable_pending || output->destroy_pending)
 		goto err;
@@ -3624,6 +3673,51 @@ drm_plane_destroy(struct drm_plane *plane)
 }
 
 /**
+ * Create a drm_plane for virtual output
+ *
+ * Call drm_virtual_plane_destroy to clean up the plane.
+ *
+ * @param b DRM compositor backend
+ * @param output Output to create internal plane for
+ */
+static struct drm_plane *
+drm_virtual_plane_create(struct drm_backend *b, struct drm_output *output)
+{
+	struct drm_plane *plane;
+
+	/* num of formats is one */
+	plane = zalloc(sizeof(*plane) + sizeof(uint32_t));
+	if (!plane) {
+		weston_log("%s: out of memory\n", __func__);
+		return NULL;
+	}
+
+	plane->backend = b;
+	plane->state_cur = drm_plane_state_alloc(NULL, plane);
+	plane->state_cur->complete = true;
+	plane->count_formats = 1;
+
+	weston_plane_init(&plane->base, b->compositor, 0, 0);
+	wl_list_insert(&b->plane_list, &plane->link);
+
+	return plane;
+}
+
+/**
+ * Destroy one DRM plane
+ *
+ * @param plane Plane to deallocate (will be freed)
+ */
+static void
+drm_virtual_plane_destroy(struct drm_plane *plane)
+{
+	drm_plane_state_free(plane->state_cur, true);
+	weston_plane_release(&plane->base);
+	wl_list_remove(&plane->link);
+	free(plane);
+}
+
+/**
  * Initialise sprites (overlay planes)
  *
  * Walk the list of provided DRM planes, and add overlay planes.
@@ -4538,6 +4632,9 @@ drm_output_set_mode(struct weston_output *base,
 	struct drm_mode *current;
 	drmModeModeInfo crtc_mode;
 
+	if (output->virtual)
+		return -1;
+
 	if (connector_get_current_mode(output->connector, b->drm.fd, &crtc_mode) < 0)
 		return -1;
 
@@ -4712,6 +4809,8 @@ drm_output_enable(struct weston_output *base)
 	struct drm_backend *b = to_drm_backend(base->compositor);
 	struct weston_mode *m;
 
+	assert(!output->virtual);
+
 	if (b->pageflip_timeout)
 		drm_output_pageflip_timer_create(output);
 
@@ -4816,6 +4915,8 @@ drm_output_destroy(struct weston_output *base)
 	struct drm_output *output = to_drm_output(base);
 	struct drm_backend *b = to_drm_backend(base->compositor);
 
+	assert(!output->virtual);
+
 	if (output->page_flip_pending || output->vblank_pending ||
 	    output->atomic_complete_pending) {
 		output->destroy_pending = 1;
@@ -4851,6 +4952,8 @@ static int
 drm_output_disable(struct weston_output *base)
 {
 	struct drm_output *output = to_drm_output(base);
+
+	assert(!output->virtual);
 
 	if (output->page_flip_pending || output->vblank_pending ||
 	    output->atomic_complete_pending) {
@@ -5115,6 +5218,9 @@ update_outputs(struct drm_backend *b, struct udev_device *drm_device)
 			      base.link) {
 		bool disconnected = true;
 
+		if (output->virtual)
+			continue;
+
 		for (i = 0; i < resources->count_connectors; i++) {
 			if (connected[i] == output->connector_id) {
 				disconnected = false;
@@ -5132,6 +5238,9 @@ update_outputs(struct drm_backend *b, struct udev_device *drm_device)
 	wl_list_for_each_safe(output, next, &b->compositor->pending_output_list,
 			      base.link) {
 		bool disconnected = true;
+
+		if (output->virtual)
+			continue;
 
 		for (i = 0; i < resources->count_connectors; i++) {
 			if (connected[i] == output->connector_id) {
@@ -5620,10 +5729,268 @@ renderer_switch_binding(struct weston_keyboard *keyboard,
 	switch_to_gl_renderer(b);
 }
 
+static void
+drm_virtual_output_start_repaint_loop(struct weston_output *output_base)
+{
+	weston_output_finish_frame(output_base, NULL,
+				   WP_PRESENTATION_FEEDBACK_INVALID);
+}
+
+static void
+drm_virtual_output_finish_frame(struct weston_output *output_base);
+
+static void
+drm_virtual_output_finish_frame_handler(void *data)
+{
+	struct drm_output *output = data;
+
+	drm_virtual_output_finish_frame(&output->base);
+}
+
+static void
+drm_virtual_output_schedule_finish_frame(struct drm_output *output)
+{
+	struct wl_event_loop *loop;
+	struct weston_compositor *c = output->base.compositor;
+
+	loop = wl_display_get_event_loop(c->wl_display);
+	wl_event_loop_add_idle(loop, drm_virtual_output_finish_frame_handler,
+			       output);
+}
+
+static int
+drm_virtual_output_repaint(struct weston_output *output_base,
+			   pixman_region32_t *damage,
+			   void *repaint_data)
+{
+	struct drm_pending_state *pending_state = repaint_data;
+	struct drm_output_state *state = NULL;
+	struct drm_output *output = to_drm_output(output_base);
+	struct drm_plane *scanout_plane = output->scanout_plane;
+	struct drm_plane_state *scanout_state;
+
+	assert(output->virtual);
+
+	if (output->disable_pending || output->destroy_pending)
+		goto err;
+
+	assert(!output->state_last);
+
+	weston_compositor_read_presentation_clock(output->base.compositor,
+						  &output->repaint_start);
+
+	/* If planes have been disabled in the core, we might not have
+	 * hit assign_planes at all, so might not have valid output state
+	 * here. */
+	state = drm_pending_state_get_output(pending_state, output);
+	if (!state)
+		state = drm_output_state_duplicate(output->state_cur,
+						   pending_state,
+						   DRM_OUTPUT_STATE_CLEAR_PLANES);
+
+	drm_output_render(state, damage);
+	scanout_state = drm_output_state_get_plane(state, scanout_plane);
+	if (!scanout_state || !scanout_state->fb)
+		goto err;
+
+	/* if state_cur->fb == scanout_state->fb then virtual output is not
+	   repaint by gl-renderer, so that repaint timer is needed */
+	if (scanout_state->fb == scanout_plane->state_cur->fb)
+		drm_virtual_output_schedule_finish_frame(output);
+
+	return 0;
+
+err:
+	drm_output_state_free(state);
+	return -1;
+}
+
+static void
+drm_virtual_output_deinit(struct weston_output *base)
+{
+	struct drm_output *output = to_drm_output(base);
+	struct drm_backend *b = to_drm_backend(base->compositor);
+
+	drm_output_fini_egl(output);
+
+	if (!b->shutting_down) {
+		wl_list_remove(&output->scanout_plane->base.link);
+		wl_list_init(&output->scanout_plane->base.link);
+	}
+}
+
+static void
+drm_virtual_output_destroy(struct weston_output *base)
+{
+	struct drm_output *output = to_drm_output(base);
+	struct drm_backend *b = to_drm_backend(base->compositor);
+
+	assert(output->virtual);
+
+	if (output->base.enabled)
+		drm_virtual_output_deinit(&output->base);
+
+	if (!b->shutting_down)
+		drm_virtual_plane_destroy(output->scanout_plane);
+
+	weston_output_release(&output->base);
+
+	drm_output_state_free(output->state_cur);
+
+	free(output);
+}
+
+static int
+drm_virtual_output_enable(struct weston_output *output_base)
+{
+	struct drm_output *output = to_drm_output(output_base);
+	struct drm_backend *b = to_drm_backend(output_base->compositor);
+
+	assert(output->virtual);
+
+	if (b->use_pixman) {
+		weston_log("Not support pixman renderer on Virtual output\n");
+		goto err;
+	}
+
+	if (drm_output_init_egl(output, b) < 0) {
+		weston_log("Failed to init output gl state\n");
+		goto err;
+	}
+
+	output->base.start_repaint_loop = drm_virtual_output_start_repaint_loop;
+	output->base.repaint = drm_virtual_output_repaint;
+	output->base.assign_planes = NULL;
+	output->base.set_dpms = NULL;
+	output->base.switch_mode = NULL;
+	output->base.gamma_size = 0;
+	output->base.set_gamma = NULL;
+	output->base.subpixel = WL_OUTPUT_SUBPIXEL_NONE;
+
+	weston_compositor_stack_plane(b->compositor,
+				      &output->scanout_plane->base,
+				      &b->compositor->primary_plane);
+
+	weston_log("Output %s\n", output->base.name);
+
+	return 0;
+err:
+	return -1;
+}
+
+static int
+drm_virtual_output_disable(struct weston_output *base)
+{
+	struct drm_output *output = to_drm_output(base);
+
+	assert(output->virtual);
+
+	if (output->page_flip_pending) {
+		output->disable_pending = 1;
+		return -1;
+	}
+
+	if (output->base.enabled)
+		drm_virtual_output_deinit(&output->base);
+
+	return 0;
+}
+
+static struct weston_output *
+drm_virtual_output_create(struct weston_compositor *c, char *name)
+{
+	struct drm_output *output;
+	struct drm_backend *b = to_drm_backend(c);
+
+	output = zalloc(sizeof *output);
+	if (!output)
+		return NULL;
+
+	output->virtual = true;
+
+	output->gbm_bo_flags = GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING;
+
+	output->base.enable = drm_virtual_output_enable;
+	output->base.destroy = drm_virtual_output_destroy;
+	output->base.disable = drm_virtual_output_disable;
+	output->state_cur = drm_output_state_alloc(output, NULL);
+
+	weston_output_init(&output->base, c, name);
+
+	output->scanout_plane = drm_virtual_plane_create(b, output);
+	if (!output->scanout_plane) {
+		weston_log("Failed to find primary plane for output %s\n",
+			   output->base.name);
+		drm_virtual_output_destroy(&output->base);
+		return NULL;
+	}
+
+	b->atomic_modeset = false;
+	weston_compositor_add_pending_output(&output->base, c);
+
+	return &output->base;
+}
+
+static void
+drm_virtual_output_get_current_dmabuf(struct weston_output *base, int *fd,
+				      int *stride)
+{
+	struct drm_output *output = to_drm_output(base);
+	struct drm_fb *fb = output->scanout_plane->state_cur->fb;
+	int ret;
+
+	if (!fb) {
+		weston_log("fb_current = NULL\n");
+		*fd = -1;
+		return;
+	}
+
+	/* XXX: It will give us previous (not current) buffer FD, etc.,
+	   but we may need to get current one. */
+	*stride = fb->stride;
+	ret = drmPrimeHandleToFD(fb->fd, fb->handle, DRM_CLOEXEC, fd);
+	if (ret < 0) {
+		weston_log("drmPrimeHandleToFD failed, errno=%d\n", errno);
+		*fd = -1;
+	}
+}
+
+static void
+drm_virtual_output_finish_frame(struct weston_output *output_base)
+{
+	struct drm_output *output = to_drm_output(output_base);
+	struct weston_compositor *compositor = output_base->compositor;
+	struct timespec stamp;
+	int64_t repaint_time;
+
+	output->page_flip_pending = 0;
+	weston_compositor_read_presentation_clock(output->base.compositor,
+						  &stamp);
+	/* Calculate timestamp considering repaint time.
+	   The compositor subtracts repaint_msec from timestamp when one
+	   calculates wait time until the next repaint. However, virtual
+	   output could'nt use vsync interrupt, so that wait time takes
+	   repaint_msec extra. Therefore, the drm-backend subtracts
+	   (actual repaint time - repaint_msec) from timestamp */
+	repaint_time = timespec_sub_to_nsec(&stamp, &output->repaint_start);
+	timespec_add_nsec(&stamp, &stamp,
+			  compositor->repaint_msec * 1000000 - repaint_time);
+	drm_virtual_output_update_complete(output,
+					   WP_PRESENTATION_FEEDBACK_KIND_HW_COMPLETION,
+					   &stamp);
+}
+
 static const struct weston_drm_output_api api = {
 	drm_output_set_mode,
 	drm_output_set_gbm_format,
 	drm_output_set_seat,
+};
+
+static const struct weston_drm_virtual_output_api virt_api = {
+	drm_virtual_output_create,
+	drm_output_set_gbm_format,
+	drm_virtual_output_get_current_dmabuf,
+	drm_virtual_output_finish_frame
 };
 
 static struct drm_backend *
@@ -5788,6 +6155,14 @@ drm_backend_create(struct weston_compositor *compositor,
 
 	if (ret < 0) {
 		weston_log("Failed to register output API.\n");
+		goto err_udev_monitor;
+	}
+
+	ret = weston_plugin_api_register(compositor,
+					 WESTON_DRM_VIRTUAL_OUTPUT_API_NAME,
+					 &virt_api, sizeof(virt_api));
+	if (ret < 0) {
+		weston_log("Failed to register virtual output API.\n");
 		goto err_udev_monitor;
 	}
 
