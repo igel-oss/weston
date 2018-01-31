@@ -90,6 +90,35 @@ weston_drm_output_get_api(struct weston_compositor *compositor)
 	return (const struct weston_drm_output_api *)api;
 }
 
+#define WESTON_DRM_VIRTUAL_OUTPUT_API_NAME "weston_drm_virtual_output_api_v1"
+
+struct weston_drm_virtual_output_api {
+	/** Create virtual output.
+	 *
+	 * Returns output on success, NULL on failure.
+	 */
+	struct weston_output* (*virtual_create)(struct weston_compositor *c,
+						char *name);
+
+	/** Set pixel format same as drm_output set_gbm_format() */
+	void (*set_gbm_format)(struct weston_output *output,
+			       const char *gbm_format);
+
+	/** Get dmabuf fd, size and stride of current_fb */
+	void (*get_current_dmabuf)(struct weston_output *output, int *fd,
+				   int *stride);
+};
+
+static inline const struct weston_drm_virtual_output_api *
+weston_drm_virtual_output_get_api(struct weston_compositor *compositor)
+{
+	const void *api;
+	api = weston_plugin_api_get(compositor,
+				    WESTON_DRM_VIRTUAL_OUTPUT_API_NAME,
+				    sizeof(struct weston_drm_virtual_output_api));
+	return (const struct weston_drm_virtual_output_api *)api;
+}
+
 /** The backend configuration struct.
  *
  * weston_drm_backend_config contains the configuration used by a DRM
