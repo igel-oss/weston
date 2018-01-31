@@ -90,6 +90,63 @@ weston_drm_output_get_api(struct weston_compositor *compositor)
 	return (const struct weston_drm_output_api *)api;
 }
 
+#define WESTON_DRM_VIRTUAL_OUTPUT_API_NAME "weston_drm_virtual_output_api_v1"
+
+typedef int (*submit_frame_cb)(struct weston_output *output, int fd,
+			       int stride, void *buffer);
+
+struct weston_drm_virtual_output_api {
+	/** Create virtual output.
+	 * This is a low-level function, where the caller is expected to wrap
+	 * the weston_output function pointers as necessary to make the virtual
+	 * output useful. The output runs by a timer, configured by the video
+	 * mode. The caller must set up output make, model, serial, physical
+	 * size, the mode list and current mode.
+	 *
+	 * Returns output on success, NULL on failure.
+	 */
+	struct weston_output* (*virtual_create)(struct weston_compositor *c,
+						char *name);
+
+	/** Set pixel format same as drm_output set_gbm_format() */
+	void (*set_gbm_format)(struct weston_output *output,
+			       const char *gbm_format);
+
+	/** Set a callback to be called when the DRM-backend has drawn a new
+	 * frame and submits it for display.
+	 * The callback will deliver a buffer to the virtual output's the
+	 * owner and assumes the buffer is now reserved for the owner. The
+	 * callback is called in virtual output repaint function.
+	 * The caller must call buffer_released() and finish_frame().
+	 *
+	 * The callback parameters are output, FD and stride of dmabuf, and
+	 * buffer pointer.
+	 * The callback returns 0 on success, -1 on failure.
+	 */
+	void (*set_submit_frame_cb)(struct weston_output *output,
+				    submit_frame_cb cb);
+
+	/** Notify that the caller has finished using buffer */
+	void (*buffer_released)(void *buffer);
+
+	/** Notify finish frame
+	 * This function allows the output repainting mechanism to advance to
+	 * the next frame.
+	 */
+	void (*finish_frame)(struct weston_output *output,
+			     struct timespec *stamp);
+};
+
+static inline const struct weston_drm_virtual_output_api *
+weston_drm_virtual_output_get_api(struct weston_compositor *compositor)
+{
+	const void *api;
+	api = weston_plugin_api_get(compositor,
+				    WESTON_DRM_VIRTUAL_OUTPUT_API_NAME,
+				    sizeof(struct weston_drm_virtual_output_api));
+	return (const struct weston_drm_virtual_output_api *)api;
+}
+
 /** The backend configuration struct.
  *
  * weston_drm_backend_config contains the configuration used by a DRM
