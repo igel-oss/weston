@@ -176,6 +176,8 @@ struct weston_output {
 	 *  if set, a repaint will eventually occur. */
 	bool repaint_needed;
 
+	bool repainted;
+
 	/** State of the repaint loop */
 	enum {
 		REPAINT_NOT_SCHEDULED = 0, /**< idle; no repaint will occur */

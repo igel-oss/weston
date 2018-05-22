@@ -2375,6 +2375,8 @@ weston_output_maybe_repaint(struct weston_output *output, struct timespec *now,
 	int ret = 0;
 	int64_t msec_to_repaint;
 
+	output->repainted = false;
+
 	/* We're not ready yet; come back to make a decision later. */
 	if (output->repaint_status != REPAINT_SCHEDULED)
 		return ret;
@@ -2404,6 +2406,7 @@ weston_output_maybe_repaint(struct weston_output *output, struct timespec *now,
 	if (ret != 0)
 		goto err;
 
+	output->repainted = true;
 	return ret;
 
 err:
@@ -2475,6 +2478,11 @@ output_repaint_timer_handler(void *data)
 		    compositor->backend->repaint_flush(compositor,
 						       repaint_data);
 	} else {
+	    wl_list_for_each(output, &compositor->output_list, link) {
+		    if (output->repainted)
+			    weston_output_schedule_repaint_reset(output);
+	    }
+
 	    if (compositor->backend->repaint_cancel)
 		    compositor->backend->repaint_cancel(compositor,
 						        repaint_data);
